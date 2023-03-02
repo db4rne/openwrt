@@ -206,9 +206,6 @@ static int button_hotplug_create_event(const char *name, unsigned int type,
 {
 	struct bh_event *event;
 
-	pr_debug(PFX "create event, name=%s, seen=%lu, pressed=%d\n",
-		 name, seen, pressed);
-
 	event = kzalloc(sizeof(*event), GFP_KERNEL);
 	if (!event)
 		return -ENOMEM;
@@ -254,9 +251,6 @@ static void gpio_keys_handle_button(struct gpio_keys_button_data *bdata)
 	unsigned int type = bdata->b->type ?: EV_KEY;
 	int state = gpio_button_get_value(bdata);
 	unsigned long seen = jiffies;
-
-	pr_debug(PFX "event type=%u, code=%u, pressed=%d\n",
-		 type, bdata->b->code, state);
 
 	/* is this the initialization state? */
 	if (bdata->last_state == -1) {
@@ -358,21 +352,16 @@ static irqreturn_t button_handle_irq(int irq, void *_bdata)
 	return IRQ_HANDLED;
 }
 
-#ifdef CONFIG_OF
 static struct gpio_keys_platform_data *
 gpio_keys_get_devtree_pdata(struct device *dev)
 {
-	struct device_node *node, *pp;
+	struct fwnode_handle *child;
 	struct gpio_keys_platform_data *pdata;
 	struct gpio_keys_button *button;
 	int nbuttons;
 	int i = 0;
 
-	node = dev->of_node;
-	if (!node)
-		return NULL;
-
-	nbuttons = of_get_child_count(node);
+	nbuttons = device_get_child_node_count(dev);
 	if (nbuttons == 0)
 		return ERR_PTR(-EINVAL);
 
@@ -384,31 +373,34 @@ gpio_keys_get_devtree_pdata(struct device *dev)
 	pdata->buttons = (struct gpio_keys_button *)(pdata + 1);
 	pdata->nbuttons = nbuttons;
 
-	pdata->rep = !!of_get_property(node, "autorepeat", NULL);
-	of_property_read_u32(node, "poll-interval", &pdata->poll_interval);
+	pdata->rep = device_property_present(dev, "autorepeat");
+	device_property_read_u32(dev, "poll-interval", &pdata->poll_interval);
 
-	for_each_child_of_node(node, pp) {
+	device_for_each_child_node(dev, child) {
 		button = (struct gpio_keys_button *)(&pdata->buttons[i++]);
 
-		if (of_property_read_u32(pp, "linux,code", &button->code)) {
-			dev_err(dev, "Button node '%s' without keycode\n",
-				pp->full_name);
-			of_node_put(pp);
+		if (fwnode_property_read_u32(child, "linux,code", &button->code)) {
+			dev_err(dev, "Button without keycode\n");
+			fwnode_handle_put(child);
 			return ERR_PTR(-EINVAL);
 		}
 
-		button->desc = of_get_property(pp, "label", NULL);
+		fwnode_property_read_string(child, "label", &button->desc);
 
-		if (of_property_read_u32(pp, "linux,input-type", &button->type))
+		if (fwnode_property_read_u32(child, "linux,input-type", &button->type))
 			button->type = EV_KEY;
 
-		button->wakeup = !!of_get_property(pp, "gpio-key,wakeup", NULL);
+		button->wakeup =
+                        fwnode_property_read_bool(child, "wakeup-source") ||
+                        /* legacy name */
+                        fwnode_property_read_bool(child, "gpio-key,wakeup");
 
-		if (of_property_read_u32(pp, "debounce-interval",
+		if (fwnode_property_read_u32(child, "debounce-interval",
 					&button->debounce_interval))
 			button->debounce_interval = 5;
-
-		button->irq = irq_of_parse_and_map(pp, 0);
+		if (is_of_node(child))
+			button->irq =
+				irq_of_parse_and_map(to_of_node(child), 0);
 		button->gpio = -ENOENT; /* mark this as device-tree */
 	}
 
@@ -427,15 +419,6 @@ static struct of_device_id gpio_keys_polled_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, gpio_keys_polled_of_match);
 
-#else
-
-static inline struct gpio_keys_platform_data *
-gpio_keys_get_devtree_pdata(struct device *dev)
-{
-	return NULL;
-}
-#endif
-
 static int gpio_keys_button_probe(struct platform_device *pdev,
 		struct gpio_keys_button_dev **_bdev, int polled)
 {
@@ -443,14 +426,16 @@ static int gpio_keys_button_probe(struct platform_device *pdev,
 	struct gpio_keys_platform_data *pdata = dev_get_platdata(dev);
 	struct gpio_keys_button_dev *bdev;
 	struct gpio_keys_button *buttons;
-	struct device_node *prev = NULL;
+	struct fwnode_handle *prev = NULL;
 	int error = 0;
 	int i;
 
 	if (!pdata) {
 		pdata = gpio_keys_get_devtree_pdata(dev);
-		if (IS_ERR(pdata))
+		if (IS_ERR(pdata)) {
+			printk(KERN_INFO "gpio_keys_button_probe: gpio_keys_get_devtree_pdata failed %d\n", PTR_ERR(pdata));
 			return PTR_ERR(pdata);
+		}
 		if (!pdata) {
 			dev_err(dev, "missing platform data\n");
 			return -EINVAL;
@@ -528,18 +513,17 @@ static int gpio_keys_button_probe(struct platform_device *pdev,
 			}
 		} else {
 			/* Device-tree */
-			struct device_node *child =
-				of_get_next_child(dev->of_node, prev);
 
-			bdata->gpiod = devm_gpiod_get_from_of_node(dev,
-				child, "gpios", 0, GPIOD_IN, desc);
-
+			struct fwnode_handle *child = device_get_next_child_node(dev, prev);
+			bdata->gpiod = devm_fwnode_gpiod_get(dev, child,
+					NULL, GPIOD_IN, desc);
 			prev = child;
 		}
 
 		if (IS_ERR_OR_NULL(bdata->gpiod)) {
 			error = IS_ERR(bdata->gpiod) ? PTR_ERR(bdata->gpiod) :
 				-EINVAL;
+			printk(KERN_INFO "gpio_keys_button_probe no gpiod %d\n", error);
 			goto out;
 		}
 
@@ -577,7 +561,7 @@ static int gpio_keys_button_probe(struct platform_device *pdev,
 	error = 0;
 
 out:
-	of_node_put(prev);
+	fwnode_handle_put(prev);
 	return error;
 }
 
@@ -637,7 +621,7 @@ static int gpio_keys_polled_probe(struct platform_device *pdev)
 	struct gpio_keys_platform_data *pdata;
 	struct gpio_keys_button_dev *bdev;
 	int ret;
-
+	
 	ret = gpio_keys_button_probe(pdev, &bdev, 1);
 	if (ret)
 		return ret;
@@ -703,7 +687,6 @@ static struct platform_driver gpio_keys_polled_driver = {
 static int __init gpio_button_init(void)
 {
 	int ret;
-
 	ret = platform_driver_register(&gpio_keys_driver);
 	if (ret)
 		return ret;

@@ -1,0 +1,5 @@
+config GPIO_SB8XX
+        tristate "AMD FCH GPIO support"
+        depends on GENERIC_GPIO
+        help
+          Say yes here to support GPIO functionality of AMD FCH
